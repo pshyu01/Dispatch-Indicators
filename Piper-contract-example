@@ -1,0 +1,88 @@
+--HIVE SETTINGS
+SET mapreduce.job.queuename = safety_insurance_tier1;
+SET hive.strict.checks.large.query=false;
+SET parquet.compression=gzip;
+SET parquet.enable.dictionary=true;
+--DYNAMIC PARTITION SETTINGS
+SET hive.exec.dynamic.partition=true;
+set hive.exec.dynamic.partition.mode=nonstrict;
+set hive.exec.max.dynamic.partitions.pernode=500;
+set hive.exec.max.dynamic.partitions=1000;
+set hive.exec.max.created.files=200000;
+SET hive.merge.mapfiles=true;
+SET hive.merge.mapredfiles=true;
+set hive.merge.smallfiles.avgsize=4096000000;
+set hive.merge.size.per.task=4096000000;
+SET hive.execution.engine=mr;
+
+
+with trips as (
+SELECT `_row_key` as uuid,
+        datestr,
+        MAX(STRUCT(
+            base.`_created_at`, 
+            FROM_UNIXTIME(UNIX_TIMESTAMP(base.request_at, 'yyyy-MM-dd\'T\'HH:mm:ss')), 
+            base.driver_uuid, 
+            base.request_vehicle_view_id, 
+            base.workflow_uuid,  
+            base.city_id, 
+            base.marketplace, 
+            base.tenancy, 
+            base.status,
+            base.predicted_eta,
+            COALESCE(eta.actual_eta, base.actual_eta),
+            FROM_UNIXTIME(UNIX_TIMESTAMP(base.begintrip_at, 'yyyy-MM-dd\'T\'HH:mm:ss')),
+            FROM_UNIXTIME(UNIX_TIMESTAMP(base.dropoff_at, 'yyyy-MM-dd\'T\'HH:mm:ss'))
+            )
+           ) as st,
+        MAX(STRUCT(fare.`_created_at`,
+            COALESCE(fare.total,driver_fare.driver_fare),
+            COALESCE(fare.usd_fx_rate,BASE.usd_fx_rate))
+           ) as f
+  FROM rawdata.schemaless_mezzanine_trips_rows
+ WHERE datestr >= '{{macros.ds_add(ds,-1)}}'
+   and datestr <  '{{ds}}' 
+   AND base is not null
+   AND base.tenancy = 'uber/production'
+   AND base.city_id in (187,50,28,233,142,136,247)
+   AND base.marketplace = 'personal_transport'
+   AND base.status != 'fare_split'
+GROUP BY `_row_key`,
+   datestr
+)
+
+INSERT OVERWRITE TABLE safety_adhoc.tmp_pmuh_dhl_go_online_warn_ab partition (datestr)
+select t.uuid,
+       t.st.col3 as driver_uuid,
+       t.st.col6 as city_id,
+       dc.city_name,
+       dc.country_name,
+       dc.sub_region,
+       dc.region,
+       dc.mega_region,
+       t.st.col2 as request_timestamp_utc,
+       t.st.col12 as begintrip_timestamp_utc,
+       t.st.col13 as dropoff_timestamp_utc,
+       dp.uuid AS product_type_uuid,
+       dp.name AS product_type_name,
+       REGEXP_REPLACE(CASE WHEN (t.st.col5 IS NOT NULL AND t.st.col7 = 'rush') THEN 'UberEATS Marketplace (delivery) MASTER' -- delivery leg of the Marketplace trip
+                           WHEN t.st.col7 = 'agora' THEN 'UberEATS Marketplace (order) MASTER' -- order leg (when client requests)
+                           WHEN t.st.col7 = 'eats' THEN 'UberEATS Instant MASTER' -- instant trips are categorized as eats
+                           ELSE dp.parent_name END,' MASTER',''
+                     ) AS global_product_name,
+       t.st.col9 as status,
+       t.f.col2 as fare_total,
+       t.st.col10 as eta,
+       t.st.col11 as ata,
+       t.f.col2/t.f.col3 as fare_total_usd,
+       datestr
+  FROM trips AS t
+  LEFT JOIN dwh.lookup_product_vehicle_view as look
+    ON t.st.col4 = look.vehicle_view_id
+  LEFT JOIN dwh.dim_product_type as dp 
+    ON look.product_type_uuid = dp.uuid
+  LEFT JOIN dwh.dim_city as dc
+    ON t.st.col6 = dc.city_id
+;
+
+
